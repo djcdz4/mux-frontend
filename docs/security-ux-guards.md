@@ -15,6 +15,101 @@ preferences).
   write paths must reject rather than silently succeed.
 - **No secrets in the repo or logs.** Redact keys, JWTs, and webhook secrets.
 
+## Security UX guards
+
+Security UX guards are the client-side and edge-side checks that keep a user
+from being tricked into an unsafe action and keep a privileged surface from
+being reached without authorization. They are **fail closed**: when a guard
+cannot positively confirm that an action is safe and authorized, the action is
+blocked. Guards are a UX layer over the server/contract source of truth — they
+never replace server-side authorization, and a client that bypasses a guard must
+still be rejected by the server.
+
+### Guard contract
+
+- Every privileged surface (wallet, account abstraction, payments, activity
+  feed, notification preferences, audit log, settings danger zone) declares the
+  guards it enforces and the stable error code it returns when a guard trips.
+- Guards are evaluated **before** any write is dispatched. A guard that cannot
+  be evaluated (missing session, unavailable dependency, malformed input) is
+  treated as failed, not as passed.
+- Guards are **deny by default**: a new privileged surface is blocked until it
+  explicitly opts into the guards it needs.
+- The active guard set and the resolved outcome are echoed back with the result
+  so callers and support can confirm exactly what was enforced.
+
+### Typed entrypoints and error codes
+
+Guard checks are exposed through a typed entrypoint that returns a discriminated
+result. Callers must branch on the error code rather than on message text.
+Stable error codes:
+
+| Code | Meaning |
+| --- | --- |
+| `GUARD_OK` | All guards passed; the action may proceed. |
+| `GUARD_FORBIDDEN` | Caller is not authorized for the requested scope. |
+| `GUARD_AUTH_EXPIRED` | Session/JWT expired; re-auth required. |
+| `GUARD_DELEGATE_REVOKED` | Delegate/guardian grant was revoked; fail closed. |
+| `GUARD_INVALID_INPUT` | Input failed validation (unknown key, bad shape). |
+| `GUARD_CONFIRM_REQUIRED` | Destructive action requires the exact confirm phrase. |
+| `GUARD_DEPENDENCY_UNAVAILABLE` | Upstream RPC/DB/Horizon unavailable; fail closed. |
+| `GUARD_RATE_LIMITED` | Too many attempts; retry later. |
+
+Every guard evaluation carries a correlation id propagated to logs and the
+user-facing error surface so support can trace a single request.
+
+### Authorization
+
+- Privileged actions require an authorized owner/delegate/guardian session or a
+  scoped API-key/JWT. The server resolves the caller's permitted scope; the
+  client cannot request a broader scope than it holds.
+- A revoked delegate or expired session fails closed with
+  `GUARD_DELEGATE_REVOKED` or `GUARD_AUTH_EXPIRED`; a guard never substitutes
+  for authorization.
+- Deny by default: a new privileged surface is unreadable and unwritable until
+  the server grants it, so adding a surface cannot leak a previously hidden
+  capability.
+
+### Idempotency and fail-closed behavior
+
+- Writes carry an idempotency key so concurrent or replayed requests resolve to
+  a single effect rather than duplicating a spend or a state change.
+- If a dependency (RPC/DB/Horizon) is unavailable, the write fails closed with
+  `GUARD_DEPENDENCY_UNAVAILABLE`; it never returns a partial or stale-success
+  result that could hide a failed or duplicated action.
+- Destructive actions (account/wallet deletion, recovery reset) require the
+  exact confirm phrase and fail closed with `GUARD_CONFIRM_REQUIRED` until it is
+  entered.
+
+### Edge cases and failure modes
+
+- **Concurrent/replayed requests:** idempotency keys plus idempotent reads keep
+  concurrent requests consistent; replayed requests return the same result.
+- **Dependency outage:** RPC/DB/Horizon outage fails closed on writes; no silent
+  success that could mask a missing or duplicated effect.
+- **Auth expiry / wrong role / revoked delegate:** fail closed and prompt
+  re-auth; guards are never used to escalate scope.
+- **Adversarial input:** oversized batches, unknown keys, and spoofed webhooks
+  are rejected before any write; requests are rate-limited per session and per
+  IP to prevent griefing.
+- **Testnet vs mainnet:** the `network` is explicit and validated; a mainnet
+  action is never satisfied by testnet state and vice versa.
+
+### Observability
+
+- Emit structured logs with the correlation id, the resolved error code, and
+  the applied guard dimensions (never raw key material, JWTs, or webhook
+  secrets).
+- Track guard pass/fail counts, rate-limit events, and rejected-input counts so
+  ops can alert on abuse or misconfiguration.
+
+### Rollout and rollback
+
+- Changes to security UX guards that touch money paths or mainnet behavior must
+  land behind a feature flag or kill-switch.
+- Document the rollback path in the PR description: disabling the flag must
+  restore the previous behavior without data migration.
+
 ## Audit log filters
 
 The audit log is a privileged, read-only surface that exposes who did what, to
@@ -163,96 +258,37 @@ the exact phrase is entered.
 - The required phrase is a fixed, documented constant (for example
   `DELETE MY ACCOUNT`). It is never derived from user input or remote config.
 - Matching is **case-insensitive** and **whitespace-normalized**: leading and
-  trailing whitespace is trimmed and internal runs of whitespace collapse to a
-  single space before comparison. No other normalization (no unicode folding, no
-  punctuation stripping) is applied.
-- The guard exposes a typed entrypoint that returns a discriminated result.
-  Callers must branch on the state code, never on message text.
-
-### Typed states and error codes
-
-| Code | Meaning |
-| --- | --- |
-| `DANGER_CONFIRM_OK` | Phrase matches; the destructive action may proceed. |
-| `DANGER_CONFIRM_EMPTY` | Input is empty or whitespace-only. |
-| `DANGER_CONFIRM_MISMATCH` | Input does not match the required phrase. |
-| `DANGER_CONFIRM_TOO_LONG` | Input exceeds the maximum accepted length. |
-| `DANGER_CONFIRM_LOCKED` | Guard is locked (in-flight or rate-limited); retry later. |
-
-Every evaluation carries a correlation id propagated to logs and the
-user-facing error surface so support can trace a single attempt.
-
-### Fail-closed behavior
-
-- The destructive action is **disabled** unless the guard returns
-  `DANGER_CONFIRM_OK`. Empty, mismatched, oversized, or locked input keeps it
-  disabled.
-- The guard is the only path to the destructive handler. The handler must
-  re-validate the confirm result server-side; a client cannot bypass policy by
-  invoking the handler directly.
-- Inputs longer than the maximum accepted length are rejected with
-  `DANGER_CONFIRM_TOO_LONG` before any comparison, so adversarial oversized
-  input cannot be used to grief the surface.
+trailing whitespace is trimmed and internal runs of whitespace collapse to a
+single space before comparison. No other normalization is applied.
+- The confirm phrase is validated **server-side** as well as in the UI; a client
+  that skips the UI guard is still rejected with `GUARD_CONFIRM_REQUIRED`.
+- The destructive action is disabled until the phrase matches exactly; a partial
+  or near match fails closed.
 
 ### Edge cases and failure modes
 
-- **Replay / concurrency:** confirmation is single-use. Once a destructive
-  action is confirmed it is consumed; replayed or concurrent confirmations for
-  the same action fail closed with `DANGER_CONFIRM_LOCKED` and must not trigger
-  a second write.
-- **Dependency outage:** if the server cannot validate the confirmation, the
-  action fails closed; the client never proceeds on a degraded dependency.
-- **Auth expiry / wrong role / revoked delegate:** the destructive action
-  requires an authorized owner session. Expired sessions or revoked delegates
-  fail closed and prompt re-auth; the confirm phrase never substitutes for
-  authorization.
-- **Adversarial input:** oversized or malformed input is rejected before
-  comparison; rate-limit confirmation attempts per session and per IP.
-- **Testnet vs mainnet:** the guard applies identically on both; a mainnet
-  destructive action is never unlocked by a testnet confirmation.
+- **Concurrent/replayed requests:** the destructive action carries an
+  idempotency key so a double-submit resolves to a single effect.
+- **Dependency outage:** if the write dependency is unavailable, the action
+  fails closed with `GUARD_DEPENDENCY_UNAVAILABLE` rather than appearing to
+  succeed.
+- **Auth expiry / wrong role / revoked delegate:** fail closed and prompt
+  re-auth before the confirm phrase is even evaluated.
+- **Adversarial input:** oversized or scripted confirm payloads are rejected;
+  attempts are rate-limited per session and per IP.
+- **Testnet vs mainnet:** the confirm phrase guard applies on both; a mainnet
+  destructive action is never satisfied by testnet state and vice versa.
 
 ### Observability
 
-- Emit structured logs with the correlation id, the resolved state code, and
-  the action identifier. Never log the entered phrase, raw key material, JWTs,
-  or webhook secrets.
-- Track confirmation success/failure counts and lock events so ops can alert on
-  abuse or repeated mismatches.
+- Emit structured logs with the correlation id and the resolved error code
+  (never the raw confirm phrase or any key material).
+- Track confirm-guard pass/fail counts and rate-limit events so ops can alert on
+  abuse.
 
 ### Rollout and rollback
 
-- Changes to the danger-zone guard that touch money paths or mainnet behavior
+- Changes to the confirm-phrase guard that touch money paths or mainnet behavior
   must land behind a feature flag or kill-switch.
 - Document the rollback path in the PR description: disabling the flag must
   restore the previous behavior without data migration.
-
-## Wallet detail deep links
-
-Wallet detail views are addressable via deep links so that support, ops, and
-partner surfaces can hand a user a stable URL to a specific wallet. Deep links
-are a privileged surface: they resolve a wallet identifier to wallet detail and
-must not become a policy bypass.
-
-### Route contract
-
-- Canonical route: `/wallets/:walletId` (wallet detail).
-- The route accepts an optional `?network=` query parameter. Only `testnet` and
-  `mainnet` are valid values; any other value is rejected and the link fails
-  closed to the default network for the session.
-- Unknown or malformed `walletId` values render the wallet-not-found state; they
-  must never fall back to a different wallet or to a list view.
-
-### Typed entrypoints and error codes
-
-Deep-link resolution is exposed through a typed entrypoint that returns a
-discriminated result. Callers must branch on the error code rather than on
-message text. Stable error codes:
-
-| Code | Meaning |
-| --- | --- |
-| `WALLET_NOT_FOUND` | No wallet matches the identifier. |
-| `WALLET_FORBIDDEN` | Caller is not authorized for this wallet. |
-| `WALLET_AUTH_EXPIRED` | Session/JWT expired; re-auth required. |
-| `WALLET_NETWORK_MISMATCH` | Requested network does not match the wallet. |
-| `WALLET_DEPENDENCY_UNAVAILABLE` | Upstream RPC/Horizon/DB unavailable. |
-| `WAL
